@@ -15,6 +15,7 @@ public class DistanceTracker {
     static String[] inputSymbols;
     // Longest a single testcase is allowed to run
     static final int timeoutMS = 1000;
+    static int branchCounter = 0;
 
     /**
      * Converts a boolean to a MyVar object
@@ -88,7 +89,10 @@ public class DistanceTracker {
      * @param line_nr the line number of the if-statement.
      */
     public static void myIf(MyVar condition, boolean value, int line_nr){
-        System.out.println("Found a new branch");
+        branchCounter++;
+        if (branchCounter % 10000 == 0) {
+            System.out.println("Found branch: " + branchCounter);
+        }
         FuzzingLab.encounteredNewBranch(condition, value, line_nr);
     }
 
@@ -132,6 +136,7 @@ public class DistanceTracker {
             System.exit(-1);
         } catch (InterruptedException | ExecutionException e) {
             e.printStackTrace();
+            System.err.println("Error during fuzzing: " + e.getMessage());
             System.exit(-1);
         }
 

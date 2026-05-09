@@ -1,6 +1,7 @@
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 
+
 public class ProblemEven {
     static BufferedReader stdin = new BufferedReader(new InputStreamReader(System.in));
 
@@ -27,7 +28,7 @@ public class ProblemEven {
         }
 
         if (cf) {
-            throw new IllegalArgumentException("Current state has no transition for this input!");
+            throw new IllegalArgumentException("Current STATE has no transition for this input !");
         }
     }
 
