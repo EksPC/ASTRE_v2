@@ -4,12 +4,6 @@ import java.util.*;
 import com.github.javaparser.utils.Pair;
 
 
-// public enum Strategy {
-//         RANDOM,
-//         THRESHOLD,
-//         EVEN
-// }
-
 /**
  * You should write your own solution using this class.
  */
@@ -33,6 +27,7 @@ public class FuzzingLab {
         static boolean isFinished = false;
         static int discoveredBranches = 0;
         static int totalErrors = 0;
+        static Set<Integer> uniqueErrorIds = new HashSet<>();  // Track unique error IDs from stdout
         
         static final double K = 1.0;
 
@@ -43,7 +38,7 @@ public class FuzzingLab {
         // Stores the best trace observed so far for each branch target. Linked to bestBranchDistance
         static Map<String, List<String>> bestTrace = new HashMap<>();
         
-        static void setErrorCount(int count){
+        public static void setErrorCount(int count){
                 totalErrors = count;
         }
 
@@ -758,12 +753,43 @@ public class FuzzingLab {
                 
                 output("Branches reached (distance = 0): " + reachedBranches);
                 output("Branches unreached (distance > 0): " + unreachedBranches);
-                output("Total errors encountered: " + totalErrors);                
+                output("Total errors encountered: " + totalErrors);
+                
+                // Print unique errors triggered during hill climbing (detected from stdout)
+                if (uniqueErrorIds.isEmpty()) {
+                    output("Unique Errors: 0 — IDs: None");
+                } else {
+                    List<Integer> sortedErrors = new ArrayList<>(uniqueErrorIds);
+                    Collections.sort(sortedErrors);
+                    StringBuilder errorIds = new StringBuilder();
+                    for (int i = 0; i < sortedErrors.size(); i++) {
+                        if (i > 0) errorIds.append(", ");
+                        errorIds.append(sortedErrors.get(i));
+                    }
+                    output("Unique Errors: " + sortedErrors.size() + " — IDs: " + errorIds.toString());
+                }
                 
                 output("============================================");
         }
                 
-
+        /**
+         * Parses error messages from stdout and extracts error IDs
+         * Looks for patterns like "error_0", "error_1", etc.
+         * @param message the output message to scan for error patterns
+         */
+        static void parseAndTrackErrors(String message) {
+                if (message == null) return;
+                java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("error_(\\d+)");
+                java.util.regex.Matcher matcher = pattern.matcher(message);
+                while (matcher.find()) {
+                        try {
+                                int errorId = Integer.parseInt(matcher.group(1));
+                                uniqueErrorIds.add(errorId);
+                        } catch (NumberFormatException e) {
+                                // Ignore parsing errors
+                        }
+                }
+        }
 
         static List<String> getUnreachedBranchesSorted() {
                 List<String> unreachedBranches = new ArrayList<>();
@@ -836,7 +862,7 @@ public class FuzzingLab {
                 DistanceTracker.runNextFuzzedSequence(currentTrace.toArray(new String[0]));
                 
                 int searchBudget = 200;
-                int totalBudget = 20000;
+                int totalBudget = 2000;
                 Set<String> uniqueErrors = new HashSet<>();
 
                 while(!isFinished && totalBudget > 0){ 
@@ -906,11 +932,13 @@ public class FuzzingLab {
 
         /**
          * Method that is used for catching the output from standard out.
-         * You should write your own logic here.
+         * Parses error messages from the output to track unique errors.
          * @param out the string that has been outputted in the standard out.
          */
         public static void output(String out){
                 System.out.println(out);
+                parseAndTrackErrors(out);
         }
 }
+
 
