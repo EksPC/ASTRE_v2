@@ -856,16 +856,21 @@ public class FuzzingLab {
         
 
         static void run() {
-                output("Starting fuzzing lab...");   
+                output("Starting fuzzing lab...");
 
                 initialize(DistanceTracker.inputSymbols);
                 DistanceTracker.runNextFuzzedSequence(currentTrace.toArray(new String[0]));
-                
+
                 int searchBudget = 200;
-                int totalBudget = 2000;
+
+                long startTime = System.currentTimeMillis();
+                long runtimeMillis = 5 * 60 * 1000; // 5 minutes
+                long endTime = startTime + runtimeMillis;
+
                 Set<String> uniqueErrors = new HashSet<>();
 
-                while(!isFinished && totalBudget > 0){ 
+
+                while(!isFinished && System.currentTimeMillis() < endTime) {
                         try {
                                 List<String> unreachedBranches = getUnreachedBranchesSorted();
                                 
@@ -896,7 +901,6 @@ public class FuzzingLab {
                                         
                                         DistanceTracker.runNextFuzzedSequence(currentTrace.toArray(new String[0]));
 
-                                        totalBudget--;
                                         iterations++;
                                         iterationWithoutImprovement++;
                                         
