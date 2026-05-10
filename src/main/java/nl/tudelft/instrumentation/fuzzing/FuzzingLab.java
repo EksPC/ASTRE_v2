@@ -498,10 +498,110 @@ public class FuzzingLab {
                                 return mutateTraceEven(bestTrace.get(currentTarget), inputSymbols);
                         case 1:
                                 return mutateTraceOnThreshold(bestTrace.get(currentTarget), inputSymbols);
+                        case 2:
+                                return mutateTraceOnStrategy(bestTrace.get(currentTarget), inputSymbols, "quadratic");
                         default:
                                 return generateRandomTrace(inputSymbols);
                 }
         }
+
+        /* 
+        * @param trace The current trace to mutate
+        * @param symbols Available input symbols
+        * @return A new trace with adaptive number of mutations
+        */
+        static List<String> mutateTraceOnStrategy(List<String> trace, String[] symbols, String strategy) {
+                
+                int numChangesToMake;
+                
+                // Simple strategy: scale number of changes linearly with distance
+                // You can swap these commented sections to try different strategies
+        
+                switch (strategy) {
+                        case "linear":
+                                numChangesToMake = Math.max(1, Math.min(10, (int) (currentTotalTraceDistance / 10.0)));
+                
+                
+                        case "adaptive":
+                                if (currentTotalTraceDistance < 1.0) {
+                                        numChangesToMake = 1;  // Very close: minimal change
+                                } else if (currentTotalTraceDistance < 5.0) {
+                                        numChangesToMake = Math.max(1, (int) currentTotalTraceDistance);
+                                } else if (currentTotalTraceDistance < 20.0) {
+                                        numChangesToMake = Math.max(3, (int) (currentTotalTraceDistance / 2.0));
+                                } else {
+                                        numChangesToMake = Math.max(5, Math.min(10, (int) (currentTotalTraceDistance / 10.0)));
+                                }
+                
+                
+                
+                // STRATEGY 3: QUADRATIC (Uncomment to use - more aggressive when far)
+                        case "quadratic":
+                                double normalized = Math.min(1.0, currentTotalTraceDistance / 100.0);
+                                numChangesToMake = Math.max(1, Math.min(10, (int) (Math.pow(normalized, 2.0) * 10.0)));
+                
+                
+                
+                // STRATEGY 4: STEP FUNCTION (Uncomment to use - discrete tiers)
+                        case "step":
+                                if (currentTotalTraceDistance < 2.0) {
+                                        numChangesToMake = 1;
+                                } else if (currentTotalTraceDistance < 5.0) {
+                                        numChangesToMake = 2;
+                                } else if (currentTotalTraceDistance < 15.0) {
+                                        numChangesToMake = 5;
+                                } else {
+                                        numChangesToMake = 10;
+                                }
+                                
+                
+                
+                        default:
+                                numChangesToMake = 1;  // Default to minimal change
+                }
+
+
+                List<String> mutated = new ArrayList<>(trace);
+                int changesRemaining = numChangesToMake;
+                
+                // Handle empty trace
+                if (mutated.isEmpty()) {
+                        for (int i = 0; i < numChangesToMake; i++) {
+                        mutated.add(symbols[r.nextInt(symbols.length)]);
+                        }
+                        return mutated;
+                }
+                
+                // Apply mutations one by one
+                while (changesRemaining > 0) {
+                        // Pick a random operator: 0=change, 1=add, 2=delete
+                        int operator = r.nextInt(3);
+                        
+                        switch (operator) {
+                        case 0:  // CHANGE: Substitute one symbol
+                                mutated = mutateChangeSymbol(mutated, symbols);
+                                changesRemaining--;
+                                break;
+                                
+                        case 1:  // ADD: Insert a symbol
+                                mutated = mutateAddSymbol(mutated, symbols);
+                                changesRemaining--;
+                                break;
+                                
+                        case 2:  // DELETE: Remove a symbol (only if trace has more than 1)
+                                if (mutated.size() > 1) {
+                                mutated = mutateDeleteSymbol(mutated);
+                                changesRemaining--;
+                                }
+                                // If trace too small, fall through to next iteration and try another operator
+                                break;
+                        }
+                }
+                
+                return mutated;
+        }
+ 
+
 
         /**
         * Mutate by changing a random symbol to another symbol
@@ -765,7 +865,7 @@ public class FuzzingLab {
                                 while (iterations < searchBudget && !targetReached) {
                                         
                                         while (iterationWithoutImprovement < maxIterationWithoutImprovement && !targetReached) {
-                                        currentTrace = fuzz(DistanceTracker.inputSymbols, 1);  
+                                        currentTrace = fuzz(DistanceTracker.inputSymbols, 2);  
                                         currentTotalTraceDistance = 0.0;
                                         
                                         DistanceTracker.runNextFuzzedSequence(currentTrace.toArray(new String[0]));
@@ -813,3 +913,4 @@ public class FuzzingLab {
                 System.out.println(out);
         }
 }
+
