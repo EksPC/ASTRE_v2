@@ -1,10 +1,10 @@
 package nl.tudelft.instrumentation.concolic;
 
-import java.lang.reflect.Array;
 import java.util.*;
 import java.util.stream.Collectors;
 
 import com.microsoft.z3.*;
+
 class ErrorTracker {
     int errorsNumber = 0;
     Set<String> errorsList = new HashSet<>();
@@ -12,22 +12,31 @@ class ErrorTracker {
 
 
 class ExpressionsTracker{
-    // Keep track of the amount of expressions per operator type that I meet in the integer expression
     int unaryIntExpr = 0;
     int binaryIntExpr = 0;
     int unaryBoolExpr = 0;
     int binaryBoolExpr = 0;
     int stringExpr = 0;
-    
-    HashMap<String, Integer> map = new HashMap<>(); 
-
+    HashMap<String, Integer> map = new HashMap<>();
 }
+
+
 /**
- * You should write your solution using this class.
- * 
- * Z3 API: https://z3prover.github.io/api/html/classcom_1_1microsoft_1_1z3_1_1_context.html
+ * Lab 2, Task 1, subtask 2.
+ *
+ * This implementation uses concolic execution to guide fuzzing.
+ *
+ * Strategy:
+ * 1. Execute a concrete trace.
+ * 2. Whenever an instrumented branch is reached, construct the symbolic branch constraint.
+ * 3. Ask Z3 whether the opposite branch is satisfiable under the current path constraint.
+ * 4. If SAT, store the solver trace and queue it for execution.
+ * 5. If UNSAT, store the branch target so it is not solved repeatedly.
+ * 6. Prefer solver traces in fuzzing, but use mutation or random restart when the queue is empty.
  */
 public class ConcolicExecutionLab {
+
+    static final int MAX_TRACE_LENGTH = 100;
 
     static Random r = new Random();
     static Boolean isFinished = false;
@@ -35,243 +44,552 @@ public class ConcolicExecutionLab {
     static int traceLength = 10;
     static ErrorTracker tracker = new ErrorTracker();
 
+    // Five minute experiment budget, matching the previous assignment setup.
+    static final long RUN_TIME_MS = 5L * 60L * 1000L;
+
+    // Queue of traces returned by the SMT solver.
+    static final Queue<List<String>> solverTraceQueue = new ArrayDeque<>();
+
+    // Avoid executing the exact same solver trace repeatedly.
+    static final Set<String> queuedTraceKeys = new HashSet<>();
+
+    // Branch bookkeeping.
+    static final Set<String> coveredBranches = new HashSet<>();
+    static final Set<String> satisfiableBranches = new HashSet<>();
+    static final Set<String> unsatisfiableBranches = new HashSet<>();
+
+    // Branch target to trace mappings.
+    static final Map<String, List<String>> satisfiableBranchToTrace = new LinkedHashMap<>();
+    static final Map<String, List<String>> unsatisfiableBranchToTrace = new LinkedHashMap<>();
+
+    // These fields are used to classify the result of the last solver call.
+    static boolean lastSolveWasSatisfiable = false;
+    static String pendingTargetBranchKey = null;
+    static List<String> pendingCurrentTrace = null;
+
+    // Convergence graph data.
+    static long startTimeMs = 0L;
+    static final List<String> convergenceCsv = new ArrayList<>();
 
     static void initialize(String[] inputSymbols){
-        // Initialise a random trace from the input symbols of the problem.
+        isFinished = false;
         currentTrace = generateRandomTrace(inputSymbols);
+        
+        System.out.println("VALID INPUT SYMBOLS: " + Arrays.toString(PathTracker.inputSymbols));
+        
+        solverTraceQueue.clear();
+        queuedTraceKeys.clear();
+        
+
+        coveredBranches.clear();
+        satisfiableBranches.clear();
+        unsatisfiableBranches.clear();
+
+        satisfiableBranchToTrace.clear();
+        unsatisfiableBranchToTrace.clear();
+
+        tracker.errorsList.clear();
+
+        convergenceCsv.clear();
+        convergenceCsv.add("time_ms,unique_error_count,error_code");
+
+        startTimeMs = System.currentTimeMillis();
     }
 
     /**
-     * Create var, assign value and add to path constraint.
-     * @param name
-     * @param value
-     * @param s
-     * @return
+     * Create a symbolic variable, assign it a value, and add the assignment
+     * to the path constraint.
      */
     static MyVar createVar(String name, Expr value, Sort s){
         Context c = PathTracker.ctx;
-        /**
-         * Create var, assign value and add to path constraint.
-         * We show how to do it for creating new symbols, please
-         * add similar steps to the functions below in order to
-         * obtain a path constraint.
-        */
-        
-        // This causes the format like m_0, unique identifier for the static assignment (see slide 48)
-        Expr z3var = c.mkConst(c.mkSymbol(name + "_" + PathTracker.z3counter++), s);
 
-        // Create a mathematical constraint as an expression that assigns the value (input) to the newly
-        //  created variable. Add it to the pathtracker.
+        Expr z3var = c.mkConst(
+            c.mkSymbol(name + "_" + PathTracker.z3counter++),
+            s
+        );
+
         PathTracker.addToModel(c.mkEq(z3var, value));
 
         return new MyVar(z3var, name);
     }
 
+    /**
+     * Create a symbolic input variable.
+     *
+     * Input variables remain free, except that we constrain them to one of the
+     * valid input symbols of the currently running RERS problem.
+     */
     static MyVar createInput(String name, Expr value, Sort s){
-
-        // Create an input var, these should be free variables!
         Context c = PathTracker.ctx;
 
-        
-        Expr z3var = c.mkConst(c.mkSymbol(name + "_" + PathTracker.z3counter++), s); // change this line to the correct code for creating a z3var.
-        System.out.println("z3var string created: " + z3var.toString());
-        // The following code is to add an additional constraint on the input variable.
-        // The input variable must have a value that is equal to one of the input symbols.
-        BoolExpr constraint = c.mkFalse(); //Since we need to continue with OR, we start with the neutral FALSE  
+        Expr z3var = c.mkConst(
+            c.mkSymbol(name + "_" + PathTracker.z3counter++),
+            s
+        );
+
+        BoolExpr validInputConstraint = c.mkFalse();
 
         for (String input: PathTracker.inputSymbols) {
-            constraint = c.mkOr(c.mkEq(z3var, c.mkString(input)), constraint);
+            validInputConstraint = c.mkOr(
+                c.mkEq(z3var, c.mkString(input)),
+                validInputConstraint
+            );
         }
 
-        PathTracker.addToModel(constraint);
+        PathTracker.addToModel(validInputConstraint);
+
         MyVar inputVar = new MyVar(z3var, name);
 
-        // We add the input variable to the list of inputs in the PathTracker, 
-        //  this is useful for keeping track of the current inputs for the solver.
+        // Required so PathTracker.solve can reconstruct the input trace.
         PathTracker.inputs.add(inputVar);
+
         return inputVar;
     }
 
     static MyVar createBoolExpr(BoolExpr var, String operator){
-        // Handle the following unary operators: !
-        
-        return new MyVar(PathTracker.ctx.mkNot(var));
+        Context c = PathTracker.ctx;
+
+        if (operator.equals("!")) {
+            return new MyVar(c.mkNot(var));
+        }
+
+        throw new RuntimeException("Unsupported unary boolean operator: " + operator);
     }
 
     static MyVar createBoolExpr(BoolExpr left_var, BoolExpr right_var, String operator){
-        // Handle the following binary operators: &, &&, |, ||
+        Context c = PathTracker.ctx;
+
         if(operator.equals("&") || operator.equals("&&")){
-            return new MyVar(PathTracker.ctx.mkAnd(left_var, right_var));
-        } else if (operator.equals("|") || operator.equals("||")) {
-            return new MyVar(PathTracker.ctx.mkOr(left_var, right_var));
+            return new MyVar(c.mkAnd(left_var, right_var));
         }
-        
-        return new MyVar(PathTracker.ctx.mkFalse());
+
+        if (operator.equals("|") || operator.equals("||")) {
+            return new MyVar(c.mkOr(left_var, right_var));
+        }
+
+        if (operator.equals("==")) {
+            return new MyVar(c.mkEq(left_var, right_var));
+        }
+
+        if (operator.equals("!=")) {
+            return new MyVar(c.mkNot(c.mkEq(left_var, right_var)));
+        }
+
+        throw new RuntimeException("Unsupported binary boolean operator: " + operator);
     }
 
     static MyVar createIntExpr(IntExpr var, String operator){
-        // Handle the following unary operators for numerical operations: +, -
-        
+        Context c = PathTracker.ctx;
 
         if(operator.equals("+")){
             return new MyVar(var);
-        } else if (operator.equals("-")) {
-            return new MyVar(PathTracker.ctx.mkUnaryMinus(var));
         }
-        return new MyVar(PathTracker.ctx.mkFalse());
+
+        if (operator.equals("-")) {
+            return new MyVar(c.mkUnaryMinus(var));
+        }
+
+        throw new RuntimeException("Unsupported unary integer operator: " + operator);
     }
 
     static MyVar createIntExpr(IntExpr left_var, IntExpr right_var, String operator){
-        // Handle the following binary operators for numerical operations: +, -, /, *, %, ^, ==, <=, <, >= and >
+        Context c = PathTracker.ctx;
+
         if (operator.equals("+")) {
-            return new MyVar(PathTracker.ctx.mkAdd(left_var, right_var));
-        } else if (operator.equals("-")) {
-            return new MyVar(PathTracker.ctx.mkSub(left_var, right_var));
-        } else if (operator.equals("*")) {
-            return new MyVar(PathTracker.ctx.mkMul(left_var, right_var));
-        } else if (operator.equals("/")) {
-            return new MyVar(PathTracker.ctx.mkDiv(left_var, right_var));
-        } else if (operator.equals("%")) {
-            return new MyVar(PathTracker.ctx.mkMod(left_var, right_var));
-        } else if (operator.equals("^")) {
-            return new MyVar(PathTracker.ctx.mkPower(left_var, right_var));
-        } else if (operator.equals("==")) {
-            return new MyVar(PathTracker.ctx.mkEq(left_var, right_var));
-        } else if (operator.equals("<=")) {
-            return new MyVar(PathTracker.ctx.mkLe(left_var, right_var));
-        } else if (operator.equals("<")) {
-            return new MyVar(PathTracker.ctx.mkLt(left_var, right_var));
-        } else if (operator.equals(">=")) {
-            return new MyVar(PathTracker.ctx.mkGe(left_var, right_var));
-        } else if (operator.equals(">")) {
-            return new MyVar(PathTracker.ctx.mkGt(left_var, right_var));
+            return new MyVar(c.mkAdd(left_var, right_var));
         }
 
-        return new MyVar(PathTracker.ctx.mkFalse());
+        if (operator.equals("-")) {
+            return new MyVar(c.mkSub(left_var, right_var));
+        }
+
+        if (operator.equals("*")) {
+            return new MyVar(c.mkMul(left_var, right_var));
+        }
+
+        if (operator.equals("/")) {
+            return new MyVar(c.mkDiv(left_var, right_var));
+        }
+
+        if (operator.equals("%")) {
+            return new MyVar(c.mkMod(left_var, right_var));
+        }
+
+        if (operator.equals("^")) {
+            return new MyVar(c.mkPower(left_var, right_var));
+        }
+
+        if (operator.equals("==")) {
+            return new MyVar(c.mkEq(left_var, right_var));
+        }
+
+        if (operator.equals("!=")) {
+            return new MyVar(c.mkNot(c.mkEq(left_var, right_var)));
+        }
+
+        if (operator.equals("<=")) {
+            return new MyVar(c.mkLe(left_var, right_var));
+        }
+
+        if (operator.equals("<")) {
+            return new MyVar(c.mkLt(left_var, right_var));
+        }
+
+        if (operator.equals(">=")) {
+            return new MyVar(c.mkGe(left_var, right_var));
+        }
+
+        if (operator.equals(">")) {
+            return new MyVar(c.mkGt(left_var, right_var));
+        }
+
+        throw new RuntimeException("Unsupported binary integer operator: " + operator);
     }
 
     static MyVar createStringExpr(SeqExpr left_var, SeqExpr right_var, String operator){
-        
-        // We only support String.equals
-        if(operator.equals("==")){
-            return new MyVar(PathTracker.ctx.mkEq(left_var, right_var));
-        }
-        
-        return new MyVar(PathTracker.ctx.mkFalse());
-
-    }
-
-    static void assign(MyVar var, String name, Expr value, Sort s){
-        // All variable assignments, use single static assignment
-        // Create a new version of the already present variable.
         Context c = PathTracker.ctx;
-        Expr new_z3var = c.mkConst(c.mkSymbol(name + "_" + PathTracker.z3counter++), s);
-        PathTracker.addToModel(c.mkEq(new_z3var, value));
-        var.z3var = new_z3var; // Update the z3var of the MyVar to the new version.
 
-    }
-
-    static void encounteredNewBranch(MyVar condition, boolean value, int line_nr){
-        // We need to extract the new branch as a boolean expression
-        BoolExpr new_branch;
-        if(value){
-            new_branch = (BoolExpr) condition.z3var;
-        } else {
-            new_branch = PathTracker.ctx.mkNot((BoolExpr) condition.z3var);
+        if(operator.equals("==")){
+            return new MyVar(c.mkEq(left_var, right_var));
         }
-        // Call the solver
-        PathTracker.solve(new_branch, false);
-        
-    }
 
-    static void newSatisfiableInput(LinkedList<String> new_inputs) {
-        
-        List<String> trimmed_new_inputs = new_inputs.stream()
-            .map(s -> s.replaceAll("^\"|\"$", ""))
-            .collect(Collectors.toList());
-        
-        currentTrace = new ArrayList<>(trimmed_new_inputs);
-        System.out.println("New satisfiable input found! - "+ currentTrace.size());
+        if(operator.equals("!=")){
+            return new MyVar(c.mkNot(c.mkEq(left_var, right_var)));
+        }
 
+        throw new RuntimeException("Unsupported string operator: " + operator);
     }
 
     /**
-     * Method for fuzzing new inputs for a program.
-     * @param inputSymbols the inputSymbols to fuzz from.
-     * @return a fuzzed sequence
+     * Single static assignment.
+     *
+     * Every assignment creates a fresh symbolic variable version.
+     */
+    static void assign(MyVar var, String name, Expr value, Sort s){
+        Context c = PathTracker.ctx;
+
+        Expr new_z3var = c.mkConst(
+            c.mkSymbol(name + "_" + PathTracker.z3counter++),
+            s
+        );
+
+        PathTracker.addToModel(c.mkEq(new_z3var, value));
+
+        var.z3var = new_z3var;
+    }
+
+    /**
+     * Called whenever the instrumented program reaches an if statement.
+     *
+     * The important point is that we solve the opposite branch first, then add
+     * the actually taken branch to z3branches. If we add the taken branch first,
+     * the solver may receive contradictory constraints when trying to flip it.
+     */
+static void encounteredNewBranch(MyVar condition, boolean value, int line_nr){
+    Context c = PathTracker.ctx;
+
+    BoolExpr conditionExpr = (BoolExpr) condition.z3var;
+
+    BoolExpr oppositeBranch = c.mkEq(
+        conditionExpr,
+        value ? c.mkFalse() : c.mkTrue()
+    );
+
+    String takenKey = branchKey(line_nr, value);
+    String targetKey = branchKey(line_nr, !value);
+
+    coveredBranches.add(takenKey);
+
+    boolean targetAlreadyKnown =
+        coveredBranches.contains(targetKey)
+        || satisfiableBranches.contains(targetKey)
+        || unsatisfiableBranches.contains(targetKey);
+
+    if (!targetAlreadyKnown) {
+        pendingTargetBranchKey = targetKey;
+        pendingCurrentTrace = copyTrace(currentTrace);
+        lastSolveWasSatisfiable = false;
+
+        PathTracker.solve(oppositeBranch, false);
+
+        if (lastSolveWasSatisfiable) {
+            satisfiableBranches.add(targetKey);
+        } else {
+            unsatisfiableBranches.add(targetKey);
+            unsatisfiableBranchToTrace.put(
+                targetKey,
+                copyTrace(pendingCurrentTrace)
+            );
+        }
+
+        pendingTargetBranchKey = null;
+        pendingCurrentTrace = null;
+    }
+}
+
+    /**
+     * Called by PathTracker.solve when Z3 finds a satisfiable input trace.
+     */
+    static void newSatisfiableInput(LinkedList<String> new_inputs) {
+        lastSolveWasSatisfiable = true;
+
+        List<String> solverTrace = sanitizeSolverTrace(new_inputs);
+
+        // The solver trace reaches the target branch. A short random suffix helps
+        // continue exploration after that branch.
+        addExplorationSuffix(solverTrace, PathTracker.inputSymbols);
+
+        addCandidateTrace(solverTrace);
+
+        if (pendingTargetBranchKey != null) {
+            satisfiableBranchToTrace.put(
+                pendingTargetBranchKey,
+                copyTrace(solverTrace)
+            );
+        }
+
+        System.out.println(
+            "SAT branch " + pendingTargetBranchKey
+            + " -> queued trace of length "
+            + solverTrace.size()
+        );
+    }
+
+    /**
+     * Pick the next input trace.
+     *
+     * Solver traces have priority. If the solver queue is empty, use mutation
+     * or random restart to discover fresh paths and create new path constraints.
      */
     static List<String> fuzz(String[] inputSymbols){
-        /*
-         * Add here your code for fuzzing a new sequence for the RERS problem.
-         * You can guide your fuzzer to fuzz "smart" input sequences to cover
-         * more branches using concolic execution. Right now we just generate
-         * a complete random sequence using the given input symbols. Please
-         * change it to your own code.
-         */
-        return generateRandomTrace(inputSymbols);
+        if (!solverTraceQueue.isEmpty()) {
+            currentTrace = copyTrace(solverTraceQueue.poll());
+            return currentTrace;
+        }
+
+        if (currentTrace == null || r.nextDouble() < 0.35) {
+            currentTrace = generateRandomTrace(inputSymbols);
+        } else {
+            currentTrace = mutateTrace(currentTrace, inputSymbols);
+        }
+
+        return currentTrace;
     }
 
-    /**
-     * Generate a random trace from an array of symbols.
-     * @param symbols the symbols from which a trace should be generated from.
-     * @return a random trace that is generated from the given symbols.
-     */
     static List<String> generateRandomTrace(String[] symbols) {
         ArrayList<String> trace = new ArrayList<>();
-        for (int i = 0; i < traceLength; i++) {
+
+        int length = 1 + r.nextInt(Math.max(1, traceLength));
+
+        for (int i = 0; i < length; i++) {
             trace.add(symbols[r.nextInt(symbols.length)]);
         }
+
         return trace;
     }
 
     static List<String> generateTrace(){
-        // Generate a trace using the current path constraint in the PathTracker.
-        // You can use the solver to generate new inputs that satisfy the path constraint, and then generate a new trace using these inputs.
-        // For now, we just return the current trace, but you should change it to your own code.
-        return currentTrace;
+        return fuzz(PathTracker.inputSymbols);
     }
 
     static void run() {
         initialize(PathTracker.inputSymbols);
-        PathTracker.runNextFuzzedSequence(currentTrace.toArray(new String[0]));
-        // Place here your code to guide your fuzzer with its search using Concolic Execution.
-        
-        printErrorReport();
 
-        // while(!isFinished) {
-        //     // Do things!
-        //     try {
-                
-        //         System.out.println("Woohoo, looping!");
-        //         Thread.sleep(1000);
-        //     } catch (InterruptedException e) {
-        //         e.printStackTrace();
-        //     }
-        // }
+        while(!isFinished) {
+            try {
+                List<String> nextTrace = generateTrace();
+
+                PathTracker.runNextFuzzedSequence(
+                    nextTrace.toArray(new String[0])
+                );
+
+                if (System.currentTimeMillis() - startTimeMs >= RUN_TIME_MS) {
+                    isFinished = true;
+                }
+            } catch (Throwable t) {
+                System.err.println(
+                    "Trace failed: " + currentTrace + " -> " + t.getMessage()
+                );
+            }
+        }
+
+        printErrorReport();
+        printBranchReport();
+        printConvergenceCsv();
     }
 
+    static String branchKey(int line, boolean branchValue) {
+        return line + ":" + (branchValue ? "T" : "F");
+    }
+
+    static List<String> sanitizeSolverTrace(LinkedList<String> rawInputs) {
+        ArrayList<String> cleaned = new ArrayList<>();
+        
+        Set<String> validInputs = new HashSet<>(
+            Arrays.asList(PathTracker.inputSymbols)
+        );
+    
+        for (String raw : rawInputs) {
+            if (raw == null) {
+                continue;
+            }
+        
+            String symbol = raw
+                .replace("\"", "")
+                .replace("[", "")
+                .replace("]", "")
+                .replace(",", "")
+                .trim();
+        
+            if (validInputs.contains(symbol)) {
+                cleaned.add(symbol);
+            }
+        
+            if (cleaned.size() >= MAX_TRACE_LENGTH) {
+                break;
+            }
+        }
+    
+        if (cleaned.isEmpty()) {
+            cleaned.add(
+                PathTracker.inputSymbols[
+                    r.nextInt(PathTracker.inputSymbols.length)
+                ]
+            );
+        }
+    
+        return cleaned;
+    }
+
+    static void addExplorationSuffix(List<String> trace, String[] inputSymbols) {
+        int suffixLength = r.nextInt(3);
+    
+        for (int i = 0; i < suffixLength; i++) {
+            if (trace.size() >= MAX_TRACE_LENGTH) {
+                return;
+            }
+        
+            trace.add(inputSymbols[r.nextInt(inputSymbols.length)]);
+        }
+    }
+
+    static void addCandidateTrace(List<String> trace) {
+        List<String> copy = copyTrace(trace);
+        String key = traceKey(copy);
+
+        if (queuedTraceKeys.add(key)) {
+            solverTraceQueue.offer(copy);
+        }
+    }
+
+    static List<String> mutateTrace(List<String> trace, String[] inputSymbols) {
+        ArrayList<String> mutated = new ArrayList<>(trace);
+
+        if (mutated.isEmpty()) {
+            mutated.add(inputSymbols[r.nextInt(inputSymbols.length)]);
+            return mutated;
+        }
+
+        int operation = r.nextInt(3);
+
+        if (operation == 0) {
+            int index = r.nextInt(mutated.size());
+            mutated.set(index, inputSymbols[r.nextInt(inputSymbols.length)]);
+        } else if (operation == 1 && mutated.size() < 3 * traceLength) {
+            int index = r.nextInt(mutated.size() + 1);
+            mutated.add(index, inputSymbols[r.nextInt(inputSymbols.length)]);
+        } else if (mutated.size() > 1) {
+            int index = r.nextInt(mutated.size());
+            mutated.remove(index);
+        }
+
+        return mutated;
+    }
+
+    static String traceKey(List<String> trace) {
+        return String.join(",", trace);
+    }
+
+    static List<String> copyTrace(List<String> trace) {
+        if (trace == null) {
+            return new ArrayList<>();
+        }
+
+        return new ArrayList<>(trace);
+    }
 
     public static void printErrorReport(){
-
         System.out.println("========== ERROR REPORT ==========");
+    
         if (tracker.errorsList.isEmpty()) {
             System.out.println("No errors found.");
         } else {
-            int index = 1;
-            for (String error : tracker.errorsList) {
-                System.out.println("[" + index + "] " + error);
-                index++;
+            ArrayList<String> sortedErrors = new ArrayList<>(tracker.errorsList);
+        
+            sortedErrors.sort((a, b) -> {
+                try {
+                    return Integer.compare(Integer.parseInt(a), Integer.parseInt(b));
+                } catch (NumberFormatException e) {
+                    return a.compareTo(b);
+                }
+            });
+        
+            for (String error : sortedErrors) {
+                System.out.println("error_" + error);
             }
         }
+    
+        System.out.println("Total unique errors: " + tracker.errorsList.size());
         System.out.println("==================================");
+    }
+
+    public static void printBranchReport(){
+        System.out.println("========== CONCOLIC BRANCH REPORT ==========");
+        System.out.println("Covered branches: " + coveredBranches.size());
+        System.out.println("SAT branch targets: " + satisfiableBranches.size());
+        System.out.println("UNSAT branch targets: " + unsatisfiableBranches.size());
+        System.out.println("Queued solver traces not yet executed: " + solverTraceQueue.size());
+        System.out.println("===========================================");
+    }
+
+    public static void printConvergenceCsv(){
+        System.out.println("========== CONVERGENCE CSV ==========");
+
+        for (String row : convergenceCsv) {
+            System.out.println(row);
+        }
+
+        System.out.println("=====================================");
     }
 
     public static void output(String out){
         if(out.contains("error_")){
-            String errorCode = out.substring(out.lastIndexOf("_") + 1).trim();
-            tracker.errorsList.add(errorCode);
+            java.util.regex.Matcher matcher =
+                java.util.regex.Pattern.compile("error_(\\d+)").matcher(out);
+
+            if (matcher.find()) {
+                String errorCode = matcher.group(1);
+
+                boolean isNew = tracker.errorsList.add(errorCode);
+
+                if (isNew) {
+                    long elapsed = System.currentTimeMillis() - startTimeMs;
+
+                    convergenceCsv.add(
+                        elapsed + "," + tracker.errorsList.size() + "," + errorCode
+                    );
+
+                    System.out.println(
+                        "CONVERGENCE,"
+                        + elapsed + ","
+                        + tracker.errorsList.size()
+                        + ",error_"
+                        + errorCode
+                    );
+                }
+            }
         }
+
         System.out.println(out);
     }
-
 }
