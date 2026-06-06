@@ -36,7 +36,7 @@ class ExpressionsTracker{
  */
 public class ConcolicExecutionLab {
 
-    static final int MAX_TRACE_LENGTH = 100;
+    static final int MAX_TRACE_LENGTH = 200;
 
     static Random r = new Random();
     static Boolean isFinished = false;
