@@ -49,11 +49,38 @@ public class ObservationTable implements DistinguishingSequenceGenerator, Access
      *
      * You should write your own logic here.
      *
-     * @return an Optional.empty() if the table is consistent, or an Optional.of(_)
-     *         with something usefull to extend the observation table with.
+     * @return an Optional.empty() if the table is closed, or an Optional.of(_)
+     *         with something useful to extend the observation table with.
      */
     public Optional<Word<String>> checkForClosed() {
-        // TODO implement the check for closedness of the observation table.
+        // Collect all rows that currently exist in the upper (S) portion of the table.
+        List<ArrayList<String>> sRows = new ArrayList<>();
+        for (Word<String> s : S) {
+            sRows.add(table.get(s));
+        }
+
+        // For every s in S and every input symbol a, check whether the row of
+        //  s·a (which lives in the lower S·A portion) has a matching row in S.
+        for (Word<String> s : S) {
+            for (String a : inputSymbols) {
+                Word<String> sa = s.append(a);
+                ArrayList<String> saRow = table.get(sa);
+
+                boolean found = false;
+                for (ArrayList<String> sRow : sRows) {
+                    if (sRow.equals(saRow)) {
+                        found = true;
+                        break;
+                    }
+                }
+
+                // No matching row in S: the table is not closed.
+                // Return s·a so the caller can promote it into S.
+                if (!found) {
+                    return Optional.of(sa);
+                }
+            }
+        }
         return Optional.empty();
     }
 
@@ -63,12 +90,42 @@ public class ObservationTable implements DistinguishingSequenceGenerator, Access
      * You should write your own logic here.
      *
      * @return an Optional.empty() if the table is consistent, or an Optional.of(_)
-     *         with something usefull to extend the observation table with.
+     *         with something useful to extend the observation table with.
      */
     public Optional<Word<String>> checkForConsistent() {
-        // TODO implement the consistency check.
+        // Consider every pair of distinct words (s1, s2) in S.
+        for (int i = 0; i < S.size(); i++) {
+            for (int j = i + 1; j < S.size(); j++) {
+                Word<String> s1 = S.get(i);
+                Word<String> s2 = S.get(j);
+
+                // Only consider pairs whose rows are currently identical.
+                if (!table.get(s1).equals(table.get(s2))) {
+                    continue;
+                }
+
+                // For each input symbol a, the rows of s1·a and s2·a must also match.
+                for (String a : inputSymbols) {
+                    Word<String> s1a = s1.append(a);
+                    Word<String> s2a = s2.append(a);
+                    ArrayList<String> row1 = table.get(s1a);
+                    ArrayList<String> row2 = table.get(s2a);
+
+                    // Find the first column k where the two rows disagree.
+                    for (int k = 0; k < E.size(); k++) {
+                        if (!row1.get(k).equals(row2.get(k))) {
+                            // The suffix a·E[k] distinguishes s1·a from s2·a.
+                            // Return it so the caller can add it to E.
+                            Word<String> newSuffix = new Word<>(a).append(E.get(k));
+                            return Optional.of(newSuffix);
+                        }
+                    }
+                }
+            }
+        }
         return Optional.empty();
     }
+        
 
     private String getResultFromSul(Word<String> trace) {
         String res = sul.getLastOutput(trace);

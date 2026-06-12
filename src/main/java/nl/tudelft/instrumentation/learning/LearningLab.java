@@ -28,21 +28,39 @@ public class LearningLab {
         // Implement the checks for consistent and closed in the observation table.
         // Use the observation table and the equivalence checker to implement the L* learning algorithm.
         while (!isFinished) {
-            // Do things!
-            try {
-                System.out.println("Woohoo, looping!");
-                System.exit(1);
-                Thread.sleep(1000);
-            } catch (InterruptedException e) {
-                e.printStackTrace();
+            Optional<Word<String>> closed = observationTable.checkForClosed();
+            if (closed.isPresent()) {
+                observationTable.addToS(closed.get());
+                continue;
+            }
+
+            Optional<Word<String>> consistent = observationTable.checkForConsistent();
+            if (consistent.isPresent()) {
+                observationTable.addToE(consistent.get());
+                continue;
+            }
+
+            // Table is now closed and consistent — generate hypothesis and check equivalence.
+            hypothesis = observationTable.generateHypothesis();
+            Optional<Word<String>> counterExample = equivalenceChecker.verify(hypothesis);
+            if (!counterExample.isPresent()) {
+                isFinished = true;
+            } else {
+                // Add all prefixes of the counter-example to S to guarantee convergence.
+                List<String> symbols = counterExample.get().asList();
+                for (int i = 1; i <= symbols.size(); i++) {
+                    observationTable.addToS(new Word<>(symbols.subList(0, i)));
+                }
             }
         }
+
+        hypothesis.writeToDot("hypothesis.dot");
     }
 
 
     /**
      * Method that is used for catching the output from standard out.
-     * 
+     *
      * @param out the string that has been outputted in the standard out.
      */
     public static void output(String out) {
