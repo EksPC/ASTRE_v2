@@ -1,5 +1,9 @@
 package nl.tudelft.instrumentation.learning;
 
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
 import java.util.*;
 
 /**
@@ -13,20 +17,31 @@ public class LearningLab {
     static ObservationTable observationTable;
     static EquivalenceChecker equivalenceChecker;
 
+    private static final String RESULTS_DIRECTORY = "learning_results";
+
     static void run() {
+        isFinished = false;
+        long startTime = System.currentTimeMillis();
+        String problemName = LearningTracker.getProblemName();
+        int wDepth = Integer.getInteger("learning.w", defaultWDepth(problemName));
+        List<String> stateLog = new ArrayList<>();
+        stateLog.add("time_ms,states");
 
         SystemUnderLearn sul = new RersSUL();
         observationTable = new ObservationTable(LearningTracker.inputSymbols, sul);
-        equivalenceChecker = new RandomWalkEquivalenceChecker(sul, LearningTracker.inputSymbols, 100, 1000);
-        // equivalenceChecker = new WMethodEquivalenceChecker(sul, LearningTracker.inputSymbols, 1, observationTable, observationTable);
+        equivalenceChecker = new WMethodEquivalenceChecker(
+                sul,
+                LearningTracker.inputSymbols,
+                wDepth,
+                observationTable,
+                observationTable
+        );
 
         observationTable.print();
         MealyMachine hypothesis = observationTable.generateHypothesis();
-        hypothesis.writeToDot("hypothesis.dot");
+        recordStateCount(stateLog, startTime, hypothesis);
+        hypothesis.writeToDot(resultPath(problemName, "initial.dot"));
 
-        // Place here your code to learn a model of the RERS problem.
-        // Implement the checks for consistent and closed in the observation table.
-        // Use the observation table and the equivalence checker to implement the L* learning algorithm.
         while (!isFinished) {
             Optional<Word<String>> closed = observationTable.checkForClosed();
             if (closed.isPresent()) {
@@ -40,23 +55,88 @@ public class LearningLab {
                 continue;
             }
 
-            // Table is now closed and consistent — generate hypothesis and check equivalence.
             hypothesis = observationTable.generateHypothesis();
+            recordStateCount(stateLog, startTime, hypothesis);
+            hypothesis.writeToDot(resultPath(problemName, "latest.dot"));
+
             Optional<Word<String>> counterExample = equivalenceChecker.verify(hypothesis);
             if (!counterExample.isPresent()) {
                 isFinished = true;
             } else {
-                // Add all prefixes of the counter-example to S to guarantee convergence.
-                List<String> symbols = counterExample.get().asList();
-                for (int i = 1; i <= symbols.size(); i++) {
-                    observationTable.addToS(new Word<>(symbols.subList(0, i)));
+                System.out.println("Counterexample: " + counterExample.get());
+                boolean changed = addCounterExamplePrefixes(counterExample.get());
+                if (!changed) {
+                    addCounterExampleExtensions(counterExample.get());
                 }
             }
         }
 
-        hypothesis.writeToDot("hypothesis.dot");
+        hypothesis.writeToDot(resultPath(problemName, "final.dot"));
+        writeStateLog(problemName, stateLog);
+        System.out.printf("Finished learning %s with %d states using W-method depth %d.%n",
+                problemName, hypothesis.getStates().length, wDepth);
+        LearningTracker.shutdown();
     }
 
+    private static boolean addCounterExamplePrefixes(Word<String> counterExample) {
+        boolean changed = false;
+        List<Word<String>> before = observationTable.getAccessSequences();
+        List<String> symbols = counterExample.asList();
+
+        for (int i = 1; i <= symbols.size(); i++) {
+            Word<String> prefix = new Word<>(symbols.subList(0, i));
+            if (!before.contains(prefix)) {
+                changed = true;
+            }
+            observationTable.addToS(prefix);
+        }
+
+        return changed;
+    }
+
+    private static void addCounterExampleExtensions(Word<String> counterExample) {
+        for (String symbol : LearningTracker.inputSymbols) {
+            observationTable.addToS(counterExample.append(symbol));
+        }
+    }
+
+    private static int defaultWDepth(String problemName) {
+        if ("ProblemPin".equals(problemName)) {
+            return 4;
+        }
+        return 3;
+    }
+
+    private static void recordStateCount(List<String> stateLog, long startTime, MealyMachine hypothesis) {
+        long elapsed = System.currentTimeMillis() - startTime;
+        stateLog.add(elapsed + "," + hypothesis.getStates().length);
+    }
+
+    private static String resultPath(String problemName, String suffix) {
+        ensureResultsDirectoryExists();
+        return RESULTS_DIRECTORY + File.separator + problemName + "_" + suffix;
+    }
+
+    private static void writeStateLog(String problemName, List<String> stateLog) {
+        ensureResultsDirectoryExists();
+        File output = new File(RESULTS_DIRECTORY, problemName + "_states.csv");
+
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter(output))) {
+            for (String line : stateLog) {
+                writer.write(line);
+                writer.newLine();
+            }
+        } catch (IOException e) {
+            throw new RuntimeException("Could not write state log for " + problemName, e);
+        }
+    }
+
+    private static void ensureResultsDirectoryExists() {
+        File directory = new File(RESULTS_DIRECTORY);
+        if (!directory.exists() && !directory.mkdirs()) {
+            throw new RuntimeException("Could not create directory " + RESULTS_DIRECTORY);
+        }
+    }
 
     /**
      * Method that is used for catching the output from standard out.

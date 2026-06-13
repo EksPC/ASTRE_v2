@@ -62,7 +62,19 @@ public class LearningTracker {
 
     public static void reset() {
         currentOutput = "";
+        current_index = 0;
         outputs.clear();
+    }
+    
+    public static String getProblemName() {
+        if (problem == null) {
+            return "Problem";
+        }
+        return problem.getClass().getSimpleName();
+    }
+    
+    public static void shutdown() {
+        executor.shutdownNow();
     }
 
     /**
