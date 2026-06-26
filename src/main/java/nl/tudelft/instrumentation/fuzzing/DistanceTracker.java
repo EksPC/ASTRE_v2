@@ -14,7 +14,7 @@ public class DistanceTracker {
     static CallableTraceRunner<Void> problem;
     static String[] inputSymbols;
     // Longest a single testcase is allowed to run
-    static final int timeoutMS = 1000;
+    static final int timeoutMS = 100000;
     static int branchCounter = 0;
 
     /**
@@ -132,12 +132,10 @@ public class DistanceTracker {
         try {
             handler.get();
         } catch (CancellationException e) {
-            System.out.println("TIMEOUT!");
-            System.exit(-1);
+            throw new RuntimeException("TIMEOUT", e);
         } catch (InterruptedException | ExecutionException e) {
-            e.printStackTrace();
-            System.err.println("Error during fuzzing: " + e.getMessage());
-            System.exit(-1);
+            Throwable cause = (e instanceof ExecutionException && e.getCause() != null) ? e.getCause() : e;
+            throw new RuntimeException(cause.getMessage(), cause);
         }
 
     }

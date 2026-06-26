@@ -1,0 +1,11 @@
+run_index,mode,seed,executed_traces,visited_branches,reached_branches,unique_errors,runtime_seconds
+1,random,42,246836,306,306,18,300
+2,random,123,237017,306,306,18,300
+3,random,456,226116,306,306,18,300
+4,random,789,106379,306,306,18,326
+5,random,1337,995,292,292,16,300
+1,hillclimb,42,829,305,305,18,300
+2,hillclimb,123,850,300,300,16,300
+3,hillclimb,456,916,304,304,17,300
+4,hillclimb,789,677,306,306,18,2984
+5,hillclimb,1337,16112,305,305,18,11400

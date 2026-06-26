@@ -1,0 +1,3 @@
+mode,executed_traces_mean,executed_traces_std,visited_branches_mean,visited_branches_std,reached_branches_mean,reached_branches_std,unique_errors_mean,unique_errors_std,runtime_seconds_mean,runtime_seconds_std
+random,210959.00,10700.10,301.60,6.23,301.60,6.23,6.20,0.45,300.00,0.00
+hillclimb,56493.40,32705.51,1144.80,96.35,1144.80,96.35,15.00,0.00,1159.20,1371.56

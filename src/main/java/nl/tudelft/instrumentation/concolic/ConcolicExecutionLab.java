@@ -71,6 +71,16 @@ public class ConcolicExecutionLab {
     static long startTimeMs = 0L;
     static final List<String> convergenceCsv = new ArrayList<>();
 
+    static final long[] SEEDS = {42L, 123L, 456L, 789L, 1337L};
+    static long currentSeed = 0L;
+    static String outDir = "results/";
+
+    // Time-series metrics (one row per second).
+    static int executedTraces = 0;
+    static final List<long[]> timeSeriesSnapshots = new ArrayList<>();
+    static long lastSnapshotTime = 0L;
+    static final int SNAPSHOT_INTERVAL_MS = 1000;
+
     static void initialize(String[] inputSymbols){
         isFinished = false;
         currentTrace = generateRandomTrace(inputSymbols);
@@ -93,7 +103,11 @@ public class ConcolicExecutionLab {
         convergenceCsv.clear();
         convergenceCsv.add("time_ms,unique_error_count,error_code");
 
+        executedTraces = 0;
+        timeSeriesSnapshots.clear();
+
         startTimeMs = System.currentTimeMillis();
+        lastSnapshotTime = startTimeMs;
     }
 
     /**
@@ -325,6 +339,10 @@ static void encounteredNewBranch(MyVar condition, boolean value, int line_nr){
         pendingTargetBranchKey = null;
         pendingCurrentTrace = null;
     }
+
+    // Commit the taken branch to the path constraint so subsequent solves have correct context.
+    BoolExpr takenConstraint = c.mkEq(conditionExpr, value ? c.mkTrue() : c.mkFalse());
+    PathTracker.addToBranches(takenConstraint);
 }
 
     /**
@@ -393,15 +411,54 @@ static void encounteredNewBranch(MyVar condition, boolean value, int line_nr){
     }
 
     static void run() {
-        initialize(PathTracker.inputSymbols);
+        String problemName = PathTracker.problem.getClass().getSimpleName();
+        outDir = "results/" + problemName + "/";
+        new java.io.File(outDir).mkdirs();
+        System.out.println("Output directory: " + outDir);
+        List<String[]> allSummaries = new ArrayList<>();
 
-        while(!isFinished) {
+        for (int runIdx = 0; runIdx < SEEDS.length; runIdx++) {
+            long seed = SEEDS[runIdx];
+            System.out.println("=== Concolic run " + (runIdx + 1) + "/" + SEEDS.length + " (seed=" + seed + ") ===");
+            allSummaries.add(runSingleSeed(seed, runIdx + 1));
+        }
+
+        saveSummaryCSV(allSummaries);
+        saveStatsCSV(allSummaries);
+        System.out.println("All runs complete. Results saved in results/");
+        isFinished = true;
+    }
+
+    static String[] runSingleSeed(long seed, int runIndex) {
+        r = new Random(seed);
+        currentSeed = seed;
+
+        initialize(PathTracker.inputSymbols);
+        timeSeriesSnapshots.add(new long[]{0, 0, 0, 0, 0, 0, 0});
+
+        while (!isFinished) {
             try {
                 List<String> nextTrace = generateTrace();
 
                 PathTracker.runNextFuzzedSequence(
                     nextTrace.toArray(new String[0])
                 );
+
+                executedTraces++;
+
+                long now = System.currentTimeMillis();
+                if (now - lastSnapshotTime >= SNAPSHOT_INTERVAL_MS) {
+                    timeSeriesSnapshots.add(new long[]{
+                        now - startTimeMs,
+                        executedTraces,
+                        coveredBranches.size(),
+                        satisfiableBranches.size(),
+                        unsatisfiableBranches.size(),
+                        tracker.errorsList.size(),
+                        solverTraceQueue.size()
+                    });
+                    lastSnapshotTime = now;
+                }
 
                 if (System.currentTimeMillis() - startTimeMs >= RUN_TIME_MS) {
                     isFinished = true;
@@ -413,9 +470,33 @@ static void encounteredNewBranch(MyVar condition, boolean value, int line_nr){
             }
         }
 
+        long actualRuntime = System.currentTimeMillis() - startTimeMs;
+
+        timeSeriesSnapshots.add(new long[]{
+            actualRuntime,
+            executedTraces,
+            coveredBranches.size(),
+            satisfiableBranches.size(),
+            unsatisfiableBranches.size(),
+            tracker.errorsList.size(),
+            solverTraceQueue.size()
+        });
+
         printErrorReport();
         printBranchReport();
         printConvergenceCsv();
+        saveTimeSeriesCSV(runIndex, seed);
+
+        return new String[]{
+            String.valueOf(runIndex),
+            String.valueOf(seed),
+            String.valueOf(executedTraces),
+            String.valueOf(coveredBranches.size()),
+            String.valueOf(satisfiableBranches.size()),
+            String.valueOf(unsatisfiableBranches.size()),
+            String.valueOf(tracker.errorsList.size()),
+            String.valueOf(actualRuntime / 1000)
+        };
     }
 
     static String branchKey(int line, boolean branchValue) {
@@ -560,6 +641,78 @@ static void encounteredNewBranch(MyVar condition, boolean value, int line_nr){
         }
 
         System.out.println("=====================================");
+    }
+
+    static void saveTimeSeriesCSV(int runIndex, long seed) {
+        String filename = outDir + "concolic_run" + runIndex + "_seed" + seed + "_timeseries.csv";
+        try (java.io.PrintWriter pw = new java.io.PrintWriter(new java.io.FileWriter(filename))) {
+            pw.println("elapsed_ms,executed_traces,covered_branches,sat_branches,unsat_branches,unique_errors,solver_queue");
+            for (long[] s : timeSeriesSnapshots) {
+                pw.println(s[0] + "," + s[1] + "," + s[2] + "," + s[3] + "," + s[4] + "," + s[5] + "," + s[6]);
+            }
+            System.out.println("Time series saved: " + filename);
+        } catch (java.io.IOException e) {
+            System.out.println("Error saving time series: " + e.getMessage());
+        }
+    }
+
+    static void saveSummaryCSV(List<String[]> summaries) {
+        String filename = outDir + "concolic_summary.csv";
+        try (java.io.PrintWriter pw = new java.io.PrintWriter(new java.io.FileWriter(filename))) {
+            pw.println("run_index,seed,executed_traces,covered_branches,sat_branches,unsat_branches,unique_errors,runtime_seconds");
+            for (String[] s : summaries) {
+                pw.println(String.join(",", s));
+            }
+            System.out.println("Summary saved: " + filename);
+        } catch (java.io.IOException e) {
+            System.out.println("Error saving summary: " + e.getMessage());
+        }
+    }
+
+    static void saveStatsCSV(List<String[]> summaries) {
+        // row layout: run_index(0), seed(1), executed_traces(2), covered_branches(3),
+        //   sat_branches(4), unsat_branches(5), unique_errors(6), runtime_seconds(7)
+        String[] colNames = {"executed_traces", "covered_branches", "sat_branches", "unsat_branches", "unique_errors", "runtime_seconds"};
+        int[]    colIdx   = {2, 3, 4, 5, 6, 7};
+
+        String filename = outDir + "concolic_stats.csv";
+        try (java.io.PrintWriter pw = new java.io.PrintWriter(new java.io.FileWriter(filename))) {
+            StringBuilder header = new StringBuilder("mode");
+            for (String col : colNames) {
+                header.append(",").append(col).append("_mean")
+                      .append(",").append(col).append("_std");
+            }
+            pw.println(header);
+
+            StringBuilder line = new StringBuilder("concolic");
+            for (int ci : colIdx) {
+                double[] vals = new double[summaries.size()];
+                for (int i = 0; i < vals.length; i++) {
+                    vals[i] = Double.parseDouble(summaries.get(i)[ci]);
+                }
+                double m = computeMean(vals);
+                double s = computeStd(vals, m);
+                line.append(",").append(String.format("%.2f", m))
+                    .append(",").append(String.format("%.2f", s));
+            }
+            pw.println(line);
+            System.out.println("Stats saved: " + filename);
+        } catch (java.io.IOException e) {
+            System.out.println("Error saving stats: " + e.getMessage());
+        }
+    }
+
+    static double computeMean(double[] vals) {
+        double sum = 0;
+        for (double v : vals) sum += v;
+        return sum / vals.length;
+    }
+
+    static double computeStd(double[] vals, double mean) {
+        if (vals.length < 2) return 0.0;
+        double sumSq = 0;
+        for (double v : vals) sumSq += (v - mean) * (v - mean);
+        return Math.sqrt(sumSq / (vals.length - 1));
     }
 
     public static void output(String out){

@@ -37,12 +37,21 @@ public class FuzzingLab {
         
         static final double K = 1.0;
 
-        // Needed to keep track of the branches not reached yet.      
+        static long currentSeed = 0L;
+        static List<long[]> currentRunSnapshots = new ArrayList<>();
+        static long lastSnapshotTime = 0L;
+        static final int SNAPSHOT_INTERVAL_MS = 1000;
+        static final long[] SEEDS = {42L, 123L, 456L, 789L, 1337L};
+        static String outDir = "results/";
+
+        // Needed to keep track of the branches not reached yet.
         static Map<String, Double> bestBranchDistances = new HashMap<>();
 
         // Stores the best trace observed so far for each branch target. Linked to bestBranchDistance
         static Map<String, List<String>> bestTrace = new HashMap<>();
         
+        // Theoretically we could've saved both trace and distance in a single map
+
         public static void setErrorCount(int count){
                 totalErrors = count;
         }
@@ -71,10 +80,12 @@ public class FuzzingLab {
                 }
 
                 boolean oppositeValue = !value;
-        
+                
+                // Track Distance to each branch (0 for the branch we took)
                 double distanceToTakenBranch = branchDistance(condition, value);
                 double distanceToOppositeBranch = branchDistance(condition, oppositeValue);
-        
+                
+                // Current total distance accumulatd by this branch, used to guide the fuzzing strategy
                 currentTotalTraceDistance += distanceToOppositeBranch;
 
                 String takenKey = line_nr + ":" + value;
@@ -449,10 +460,14 @@ public class FuzzingLab {
         }
 
         static void updateBestDistance(String key, double distance) {
+
+                // If the current best distance doesn't contain this key or
+                //  the current trace's distance is less than the currently saved one, update the best distance and best trace
                 if (!bestBranchDistances.containsKey(key) || distance < bestBranchDistances.get(key)) {
                         bestBranchDistances.put(key, distance);
                         bestTrace.put(key, currentTrace);
 
+                        // This is used in the hill climbing strategy
                         if(key.equals(currentTarget)){
                                 targetReached = true;
                         }
@@ -503,6 +518,7 @@ public class FuzzingLab {
                 switch (strategy) {
                         case "linear":
                                 numChangesToMake = Math.max(1, Math.min(10, (int) (currentTotalTraceDistance / 10.0)));
+                                break;
 
                         case "adaptive":
                                 if (currentTotalTraceDistance < 1.0) {
@@ -514,10 +530,12 @@ public class FuzzingLab {
                                 } else {
                                         numChangesToMake = Math.max(5, Math.min(10, (int) (currentTotalTraceDistance / 10.0)));
                                 }
+                                break;
 
                         case "quadratic":
                                 double normalized = Math.min(1.0, currentTotalTraceDistance / 100.0);
                                 numChangesToMake = Math.max(1, Math.min(10, (int) (Math.pow(normalized, 2.0) * 10.0)));
+                                break;
 
                         case "step":
                                 if (currentTotalTraceDistance < 2.0) {
@@ -529,6 +547,7 @@ public class FuzzingLab {
                                 } else {
                                         numChangesToMake = 10;
                                 }
+                                break;
 
                         default:
                                 numChangesToMake = 1;
@@ -796,61 +815,292 @@ public class FuzzingLab {
                                         return unreachedBranches.get(unreachedBranches.size() / 2);
                                 }
                                 
+                                
                         default:
                                 return unreachedBranches.get(r.nextInt(unreachedBranches.size()));
                 }
         }
 
-        /**
-         * RANDOM FUZZER RUN ONLY.
-         * This runs pure random traces for 5 minutes.
-         * It does not call the smart fuzzer.
-         */
         static void run() {
-                output("Starting RANDOM fuzzing lab...");
+                String problemName = DistanceTracker.problem.getClass().getSimpleName();
+                outDir = "results/" + problemName + "/";
+                new java.io.File(outDir).mkdirs();
+
+                output("Starting fuzzing lab: " + SEEDS.length + " random + " + SEEDS.length + " hill-climbing runs (5 mins each)...");
+                output("Output directory: " + outDir);
+
+                List<String[]> allSummaries = new ArrayList<>();
+
+                output("========== RANDOM FUZZING PHASE ==========");
+                for (int runIdx = 0; runIdx < SEEDS.length; runIdx++) {
+                        long seed = SEEDS[runIdx];
+                        output("=== Random run " + (runIdx + 1) + "/" + SEEDS.length + " (seed=" + seed + ") ===");
+                        allSummaries.add(runSingleSeed(seed, runIdx + 1, "random"));
+                }
+
+                output("========== HILL-CLIMBING FUZZING PHASE ==========");
+                for (int runIdx = 0; runIdx < SEEDS.length; runIdx++) {
+                        long seed = SEEDS[runIdx];
+                        output("=== Hill-climbing run " + (runIdx + 1) + "/" + SEEDS.length + " (seed=" + seed + ") ===");
+                        allSummaries.add(runSingleSeed(seed, runIdx + 1, "hillclimb"));
+                }
+
+                saveSummaryCSV(allSummaries);
+                saveStatsCSV(allSummaries);
+                output("All runs complete. Results saved in results/");
+                isFinished = true;
+        }
+
+        static String[] runSingleSeed(long seed, int runIndex, String mode) {
+                r = new Random(seed);
+                currentSeed = seed;
+                bestTraceAndDistance = null;
+                currentTarget = null;
+                targetReached = false;
+                iterationWithoutImprovement = 0;
+                discoveredBranches = 0;
+                totalErrors = 0;
+                bestBranchDistances = new HashMap<>();
+                bestTrace = new HashMap<>();
+                currentRunSnapshots = new ArrayList<>();
 
                 initialize(DistanceTracker.inputSymbols);
 
                 long startTime = System.currentTimeMillis();
-                long runtimeMillis = 5 * 60 * 1000;
+                long runtimeMillis = 5 * 60 * 1000L;
                 long endTime = startTime + runtimeMillis;
-
+                lastSnapshotTime = startTime;
                 int executedTraces = 0;
 
-                while (!isFinished && System.currentTimeMillis() < endTime) {
-                        try {
-                                currentTrace = generateRandomTrace(DistanceTracker.inputSymbols);
-                                currentTotalTraceDistance = 0.0;
+                currentRunSnapshots.add(new long[]{0, 0, 0, 0, 0});
 
-                                currentTraceBranches.clear();
+                if (mode.equals("random")) {
+                        while (System.currentTimeMillis() < endTime) {
+                                try {
+                                        currentTrace = generateRandomTrace(DistanceTracker.inputSymbols);
+                                        currentTotalTraceDistance = 0.0;
+                                        currentTraceBranches.clear();
 
-                                DistanceTracker.runNextFuzzedSequence(currentTrace.toArray(new String[0]));
+                                        DistanceTracker.runNextFuzzedSequence(currentTrace.toArray(new String[0]));
 
-                                updateBestRandomTrace();
+                                        updateBestRandomTrace();
+                                        executedTraces++;
 
-                                executedTraces++;
+                                        long now = System.currentTimeMillis();
+                                        if (now - lastSnapshotTime >= SNAPSHOT_INTERVAL_MS) {
+                                                currentRunSnapshots.add(new long[]{
+                                                        now - startTime,
+                                                        executedTraces,
+                                                        totalVisitedBranches.size(),
+                                                        countReachedBranches(),
+                                                        uniqueErrorIds.size()
+                                                });
+                                                lastSnapshotTime = now;
+                                                output("[Run " + runIndex + " random] Traces: " + executedTraces
+                                                        + ", visited: " + totalVisitedBranches.size()
+                                                        + ", reached: " + countReachedBranches()
+                                                        + ", errors: " + uniqueErrorIds.size());
+                                        }
 
-                                if (executedTraces % 1000 == 0) {
-                                        output("[Progress] Executed traces: " + executedTraces
-                                                + ", total actual unique branches visited: " + totalVisitedBranches.size()
-                                                + ", best single-trace branch count: " + bestSingleTraceBranchCount
-                                                + ", unique errors: " + uniqueErrorIds.size());
+                                } catch (Exception e) {
+                                        output("Error: " + e.getMessage());
+                                        parseAndTrackErrors(e.getMessage());
+                                }
+                        }
+                } else { // hillclimb
+                        while (System.currentTimeMillis() < endTime) {
+                                List<String> unreached = getUnreachedBranchesSorted();
+                                currentTarget = getNextTarget(unreached, "shortest");
+
+                                if (currentTarget == null) {
+                                        // All known branches covered; run random to discover new ones
+                                        try {
+                                                currentTrace = generateRandomTrace(DistanceTracker.inputSymbols);
+                                                currentTotalTraceDistance = 0.0;
+                                                currentTraceBranches.clear();
+                                                DistanceTracker.runNextFuzzedSequence(currentTrace.toArray(new String[0]));
+                                                updateBestRandomTrace();
+                                                executedTraces++;
+                                        } catch (Exception e) {
+                                                output("Error: " + e.getMessage());
+                                                parseAndTrackErrors(e.getMessage());
+                                        }
+                                        continue;
                                 }
 
-                        } catch (Exception e) {
-                                output("Error during random fuzzing: " + e.getMessage());
-                                parseAndTrackErrors(e.getMessage());
+                                int noImproveCount = 0;
+
+                                while (noImproveCount < maxIterationWithoutImprovement
+                                       && System.currentTimeMillis() < endTime) {
+                                        double prevBestDist = bestBranchDistances.getOrDefault(currentTarget, Double.MAX_VALUE);
+
+                                        currentTrace = fuzz(DistanceTracker.inputSymbols, 2);
+                                        currentTotalTraceDistance = 0.0;
+                                        currentTraceBranches.clear();
+
+                                        try {
+                                                DistanceTracker.runNextFuzzedSequence(currentTrace.toArray(new String[0]));
+                                        } catch (Exception e) {
+                                                output("Error: " + e.getMessage());
+                                                parseAndTrackErrors(e.getMessage());
+                                        }
+
+                                        updateBestRandomTrace();
+                                        executedTraces++;
+
+                                        double newBestDist = bestBranchDistances.getOrDefault(currentTarget, Double.MAX_VALUE);
+                                        if (newBestDist < prevBestDist) {
+                                                noImproveCount = 0;
+                                                if (newBestDist == 0.0) break;
+                                        } else {
+                                                noImproveCount++;
+                                        }
+
+                                        long now = System.currentTimeMillis();
+                                        if (now - lastSnapshotTime >= SNAPSHOT_INTERVAL_MS) {
+                                                currentRunSnapshots.add(new long[]{
+                                                        now - startTime,
+                                                        executedTraces,
+                                                        totalVisitedBranches.size(),
+                                                        countReachedBranches(),
+                                                        uniqueErrorIds.size()
+                                                });
+                                                lastSnapshotTime = now;
+                                                output("[Run " + runIndex + " hillclimb] Traces: " + executedTraces
+                                                        + ", target: " + currentTarget
+                                                        + ", dist: " + String.format("%.3f", newBestDist)
+                                                        + ", reached: " + countReachedBranches() + "/" + bestBranchDistances.size()
+                                                        + ", errors: " + uniqueErrorIds.size());
+                                        }
+                                }
+
+                                // Random restart if target was not covered
+                                if (bestBranchDistances.getOrDefault(currentTarget, Double.MAX_VALUE) > 0.0) {
+                                        try {
+                                                currentTrace = generateRandomTrace(DistanceTracker.inputSymbols);
+                                                currentTotalTraceDistance = 0.0;
+                                                currentTraceBranches.clear();
+                                                DistanceTracker.runNextFuzzedSequence(currentTrace.toArray(new String[0]));
+                                                updateBestRandomTrace();
+                                                executedTraces++;
+                                        } catch (Exception e) {
+                                                output("Error: " + e.getMessage());
+                                                parseAndTrackErrors(e.getMessage());
+                                        }
+                                }
                         }
                 }
 
-                long actualRuntimeSeconds = (System.currentTimeMillis() - startTime) / 1000;
+                long actualRuntime = System.currentTimeMillis() - startTime;
 
-                output("End RANDOM fuzzing lab.");
-                output("Actual runtime seconds: " + actualRuntimeSeconds);
-                output("Executed traces: " + executedTraces);
+                currentRunSnapshots.add(new long[]{
+                        actualRuntime,
+                        executedTraces,
+                        totalVisitedBranches.size(),
+                        countReachedBranches(),
+                        uniqueErrorIds.size()
+                });
 
-                isFinished = true;
+                saveTimeSeriesCSV(runIndex, seed, mode, currentRunSnapshots);
                 printUniqueBranches();
+
+                return new String[]{
+                        String.valueOf(runIndex),
+                        mode,
+                        String.valueOf(seed),
+                        String.valueOf(executedTraces),
+                        String.valueOf(totalVisitedBranches.size()),
+                        String.valueOf(countReachedBranches()),
+                        String.valueOf(uniqueErrorIds.size()),
+                        String.valueOf(actualRuntime / 1000)
+                };
+        }
+
+        static int countReachedBranches() {
+                int count = 0;
+                for (double d : bestBranchDistances.values()) {
+                        if (d == 0.0) count++;
+                }
+                return count;
+        }
+
+        static void saveTimeSeriesCSV(int runIndex, long seed, String mode, List<long[]> snapshots) {
+                String filename = outDir + "run" + runIndex + "_seed" + seed + "_" + mode + "_timeseries.csv";
+                try (java.io.PrintWriter pw = new java.io.PrintWriter(new java.io.FileWriter(filename))) {
+                        pw.println("elapsed_ms,executed_traces,visited_branches,reached_branches,unique_errors");
+                        for (long[] s : snapshots) {
+                                pw.println(s[0] + "," + s[1] + "," + s[2] + "," + s[3] + "," + s[4]);
+                        }
+                        output("Time series saved: " + filename);
+                } catch (java.io.IOException e) {
+                        output("Error saving time series: " + e.getMessage());
+                }
+        }
+
+        static void saveSummaryCSV(List<String[]> summaries) {
+                String filename = outDir + "summary.csv";
+                try (java.io.PrintWriter pw = new java.io.PrintWriter(new java.io.FileWriter(filename))) {
+                        pw.println("run_index,mode,seed,executed_traces,visited_branches,reached_branches,unique_errors,runtime_seconds");
+                        for (String[] s : summaries) {
+                                pw.println(String.join(",", s));
+                        }
+                        output("Summary saved: " + filename);
+                } catch (java.io.IOException e) {
+                        output("Error saving summary: " + e.getMessage());
+                }
+        }
+
+        static void saveStatsCSV(List<String[]> summaries) {
+                // summary row layout: run_index(0), mode(1), seed(2), executed_traces(3),
+                //   visited_branches(4), reached_branches(5), unique_errors(6), runtime_seconds(7)
+                String[] colNames = {"executed_traces", "visited_branches", "reached_branches", "unique_errors", "runtime_seconds"};
+                int[]    colIdx   = {3, 4, 5, 6, 7};
+
+                Map<String, List<String[]>> byMode = new java.util.LinkedHashMap<>();
+                for (String[] row : summaries) {
+                        byMode.computeIfAbsent(row[1], k -> new ArrayList<>()).add(row);
+                }
+
+                String filename = outDir + "stats.csv";
+                try (java.io.PrintWriter pw = new java.io.PrintWriter(new java.io.FileWriter(filename))) {
+                        StringBuilder header = new StringBuilder("mode");
+                        for (String col : colNames) {
+                                header.append(",").append(col).append("_mean")
+                                      .append(",").append(col).append("_std");
+                        }
+                        pw.println(header);
+
+                        for (Map.Entry<String, List<String[]>> entry : byMode.entrySet()) {
+                                StringBuilder line = new StringBuilder(entry.getKey());
+                                for (int ci : colIdx) {
+                                        double[] vals = new double[entry.getValue().size()];
+                                        for (int i = 0; i < vals.length; i++) {
+                                                vals[i] = Double.parseDouble(entry.getValue().get(i)[ci]);
+                                        }
+                                        double m = computeMean(vals);
+                                        double s = computeStd(vals, m);
+                                        line.append(",").append(String.format("%.2f", m))
+                                            .append(",").append(String.format("%.2f", s));
+                                }
+                                pw.println(line);
+                        }
+                        output("Stats saved: " + filename);
+                } catch (java.io.IOException e) {
+                        output("Error saving stats: " + e.getMessage());
+                }
+        }
+
+        static double computeMean(double[] vals) {
+                double sum = 0;
+                for (double v : vals) sum += v;
+                return sum / vals.length;
+        }
+
+        static double computeStd(double[] vals, double mean) {
+                if (vals.length < 2) return 0.0;
+                double sumSq = 0;
+                for (double v : vals) sumSq += (v - mean) * (v - mean);
+                return Math.sqrt(sumSq / (vals.length - 1));
         }
 
         /**
@@ -860,6 +1110,7 @@ public class FuzzingLab {
          */
         public static void output(String out){
                 System.out.println(out);
+                
                 parseAndTrackErrors(out);
         }
 }

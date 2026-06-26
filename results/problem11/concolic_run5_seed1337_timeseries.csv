@@ -1,0 +1,4 @@
+elapsed_ms,executed_traces,covered_branches,sat_branches,unsat_branches,unique_errors,solver_queue
+0,0,0,0,0,0,0
+387299,1,126,4,118,0,1
+387299,1,126,4,118,0,1
