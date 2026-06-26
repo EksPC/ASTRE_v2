@@ -1,0 +1,6 @@
+run_index,seed,executed_traces,covered_branches,sat_branches,unsat_branches,unique_errors,runtime_seconds
+1,42,2492,198,10,171,2,309
+2,123,1,149,3,139,1,1419
+3,456,1,150,5,139,0,1000
+4,789,1,139,3,132,0,604
+5,1337,2,148,3,139,1,606

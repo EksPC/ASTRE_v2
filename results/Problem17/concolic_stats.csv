@@ -1,0 +1,2 @@
+mode,executed_traces_mean,executed_traces_std,covered_branches_mean,covered_branches_std,sat_branches_mean,sat_branches_std,unsat_branches_mean,unsat_branches_std,unique_errors_mean,unique_errors_std,runtime_seconds_mean,runtime_seconds_std
+concolic,58.40,120.02,404.60,123.72,43.80,25.02,308.40,68.84,2.40,3.21,337.60,16.13
