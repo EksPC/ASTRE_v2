@@ -43,6 +43,17 @@ public class FuzzingLab {
         static final int SNAPSHOT_INTERVAL_MS = 1000;
         static final long[] SEEDS = {42L, 123L, 456L, 789L, 1337L};
         static String outDir = "results/";
+        static String resultsRoot = "results";
+        static long runtimeMillis = 5 * 60 * 1000L;
+        static String[] activeModes = {"hill_base", "hill_improved"};
+
+        // Improvement-specific state for the coverage-aware hill climber.
+        static List<List<String>> coverageCorpus = new ArrayList<>();
+        static int maxCorpusSize = 200;
+        static int lastCorpusCoverage = 0;
+        static int lastCorpusErrorCount = 0;
+        static Map<String, Integer> targetAttempts = new HashMap<>();
+        static Map<String, Integer> targetSuccesses = new HashMap<>();
 
         // Needed to keep track of the branches not reached yet.
         static Map<String, Double> bestBranchDistances = new HashMap<>();
@@ -67,6 +78,12 @@ public class FuzzingLab {
                 bestSingleTraceBranchCount = 0;
                 bestSingleTrace = new ArrayList<>();
                 uniqueErrorIds.clear();
+
+                coverageCorpus.clear();
+                lastCorpusCoverage = 0;
+                lastCorpusErrorCount = 0;
+                targetAttempts.clear();
+                targetSuccesses.clear();
         }
 
         /**
@@ -787,7 +804,7 @@ public class FuzzingLab {
                 if (unreachedBranches.isEmpty()) {
                         return null;
                 }
-                
+
                 switch (selectionType) {
                         case "shortest":
                                 double bestDistance = Double.MAX_VALUE;
@@ -802,11 +819,14 @@ public class FuzzingLab {
                                 }
 
                                 return bestBranch;
-                        
+
+                        case "coverageAware":
+                                return getCoverageAwareTarget(unreachedBranches);
+
                         case "mixed":
                                 int x = r.nextInt(100);
                                 int delta = r.nextInt(Math.max(1, unreachedBranches.size() / 3));
-                                
+
                                 if (x > 60) {
                                         return unreachedBranches.get(delta);
                                 } else if (x < 30) {
@@ -814,44 +834,242 @@ public class FuzzingLab {
                                 } else {
                                         return unreachedBranches.get(unreachedBranches.size() / 2);
                                 }
-                                
-                                
+
                         default:
                                 return unreachedBranches.get(r.nextInt(unreachedBranches.size()));
                 }
         }
 
+        /**
+         * Improved target choice for Task 3.
+         *
+         * The base hill climber always follows the closest currently known unreached branch.
+         * That is greedy and can repeatedly spend the budget on targets that do not lead to
+         * new coverage. The improved version still favours small branch distances, but adds
+         * a penalty for targets that have already consumed many attempts. With 20% probability
+         * it explores a random known target to avoid repeatedly attacking the same local basin.
+         */
+        static String getCoverageAwareTarget(List<String> unreachedBranches) {
+                if (unreachedBranches.size() == 1) {
+                        return unreachedBranches.get(0);
+                }
+
+                if (r.nextDouble() < 0.20) {
+                        return unreachedBranches.get(r.nextInt(unreachedBranches.size()));
+                }
+
+                String bestBranch = unreachedBranches.get(0);
+                double bestScore = Double.MAX_VALUE;
+
+                int candidateLimit = Math.min(25, unreachedBranches.size());
+                for (int i = 0; i < candidateLimit; i++) {
+                        String branch = unreachedBranches.get(i);
+                        double distance = normalize(bestBranchDistances.getOrDefault(branch, Double.MAX_VALUE));
+                        int attempts = targetAttempts.getOrDefault(branch, 0);
+                        int successes = targetSuccesses.getOrDefault(branch, 0);
+
+                        double stagnationPenalty = 0.03 * attempts;
+                        double successBonus = successes > 0 ? -0.10 : 0.0;
+                        double score = distance + stagnationPenalty + successBonus;
+
+                        if (score < bestScore) {
+                                bestScore = score;
+                                bestBranch = branch;
+                        }
+                }
+
+                return bestBranch;
+        }
+
+        static boolean isHillMode(String mode) {
+                return mode.equals("hill_base") || mode.equals("hill_improved") || mode.equals("hillclimb");
+        }
+
+        static boolean isImprovedMode(String mode) {
+                return mode.equals("hill_improved");
+        }
+
+        static void configureFromSystemProperties() {
+                runtimeMillis = Long.parseLong(System.getProperty("fuzzing.timeoutSeconds", "300")) * 1000L;
+                traceLength = Integer.parseInt(System.getProperty("fuzzing.traceLength", "10"));
+                maxIterationWithoutImprovement = Integer.parseInt(System.getProperty("fuzzing.maxNoImprove", "50"));
+                maxCorpusSize = Integer.parseInt(System.getProperty("fuzzing.maxCorpusSize", "200"));
+                resultsRoot = System.getProperty("fuzzing.resultsDir", "results");
+
+                String modesProperty = System.getProperty("fuzzing.modes", "hill_base,hill_improved");
+                String[] rawModes = modesProperty.split(",");
+                List<String> parsedModes = new ArrayList<>();
+                for (String rawMode : rawModes) {
+                        String mode = rawMode.trim();
+                        if (!mode.isEmpty()) {
+                                parsedModes.add(mode);
+                        }
+                }
+                if (!parsedModes.isEmpty()) {
+                        activeModes = parsedModes.toArray(new String[0]);
+                }
+        }
+
+        static List<String> fuzzImproved(String[] inputSymbols, int noImproveCount) {
+                if (r.nextDouble() < 0.05) {
+                        return generateCompletelyRandomTrace(inputSymbols);
+                }
+
+                List<String> seedTrace;
+                if (currentTarget != null && bestTrace.get(currentTarget) != null && r.nextDouble() < 0.70) {
+                        seedTrace = bestTrace.get(currentTarget);
+                } else if (!coverageCorpus.isEmpty()) {
+                        seedTrace = coverageCorpus.get(r.nextInt(coverageCorpus.size()));
+                } else if (currentTarget != null && bestTrace.get(currentTarget) != null) {
+                        seedTrace = bestTrace.get(currentTarget);
+                } else {
+                        seedTrace = generateRandomTrace(inputSymbols);
+                }
+
+                double targetDistance = currentTarget == null
+                                ? Double.MAX_VALUE
+                                : bestBranchDistances.getOrDefault(currentTarget, Double.MAX_VALUE);
+                int strength = adaptiveMutationStrength(targetDistance, noImproveCount, seedTrace.size());
+                List<String> mutated = mutateTraceWithStrength(seedTrace, inputSymbols, strength);
+
+                if (noImproveCount > maxIterationWithoutImprovement / 2 && !coverageCorpus.isEmpty() && r.nextDouble() < 0.30) {
+                        mutated = spliceWithCorpusTrace(mutated, inputSymbols);
+                }
+
+                return mutated;
+        }
+
+        static int adaptiveMutationStrength(double targetDistance, int noImproveCount, int traceSize) {
+                int strength;
+                double normalizedDistance = normalize(targetDistance);
+
+                if (targetDistance == 0.0 || normalizedDistance < 0.10) {
+                        strength = 1;
+                } else if (normalizedDistance < 0.50) {
+                        strength = 2;
+                } else {
+                        strength = 3;
+                }
+
+                strength += noImproveCount / 15;
+
+                int maxStrength = Math.max(1, Math.min(12, traceSize + 2));
+                return Math.max(1, Math.min(maxStrength, strength));
+        }
+
+        static List<String> mutateTraceWithStrength(List<String> trace, String[] symbols, int strength) {
+                List<String> mutated = new ArrayList<>(trace);
+                if (mutated.isEmpty()) {
+                        mutated.add(symbols[r.nextInt(symbols.length)]);
+                }
+
+                for (int i = 0; i < strength; i++) {
+                        double choice = r.nextDouble();
+                        if (choice < 0.60) {
+                                mutated = mutateChangeSymbol(mutated, symbols);
+                        } else if (choice < 0.82) {
+                                mutated = mutateAddSymbol(mutated, symbols);
+                        } else if (mutated.size() > 1) {
+                                mutated = mutateDeleteSymbol(mutated);
+                        } else {
+                                mutated = mutateChangeSymbol(mutated, symbols);
+                        }
+                }
+
+                return mutated;
+        }
+
+        static List<String> spliceWithCorpusTrace(List<String> trace, String[] symbols) {
+                if (coverageCorpus.isEmpty()) {
+                        return mutateTraceWithStrength(trace, symbols, 1);
+                }
+
+                List<String> other = coverageCorpus.get(r.nextInt(coverageCorpus.size()));
+                if (trace.isEmpty() || other.isEmpty()) {
+                        return mutateTraceWithStrength(trace, symbols, 1);
+                }
+
+                int splitA = r.nextInt(trace.size());
+                int splitB = r.nextInt(other.size());
+                List<String> spliced = new ArrayList<>();
+                spliced.addAll(trace.subList(0, splitA));
+                spliced.addAll(other.subList(splitB, other.size()));
+
+                if (spliced.isEmpty()) {
+                        spliced.add(symbols[r.nextInt(symbols.length)]);
+                }
+
+                return spliced;
+        }
+
+        static void recordInterestingTrace(List<String> trace) {
+                int coverage = totalVisitedBranches.size();
+                int errorCount = uniqueErrorIds.size();
+
+                if (coverageCorpus.isEmpty() || coverage > lastCorpusCoverage || errorCount > lastCorpusErrorCount) {
+                        coverageCorpus.add(new ArrayList<>(trace));
+                        lastCorpusCoverage = coverage;
+                        lastCorpusErrorCount = errorCount;
+
+                        while (coverageCorpus.size() > maxCorpusSize) {
+                                coverageCorpus.remove(0);
+                        }
+                }
+        }
+
+        static void executeTraceAndUpdateCorpus(List<String> trace, boolean useCorpus) {
+                currentTrace = trace;
+                currentTotalTraceDistance = 0.0;
+                currentTraceBranches.clear();
+
+                try {
+                        DistanceTracker.runNextFuzzedSequence(currentTrace.toArray(new String[0]));
+                } catch (Exception e) {
+                        output("Error: " + e.getMessage());
+                        parseAndTrackErrors(e.getMessage());
+                }
+
+                updateBestRandomTrace();
+                if (useCorpus) {
+                        recordInterestingTrace(currentTrace);
+                }
+        }
+
         static void run() {
+                configureFromSystemProperties();
+
                 String problemName = DistanceTracker.problem.getClass().getSimpleName();
-                outDir = "results/" + problemName + "/";
+                outDir = resultsRoot + "/" + problemName + "/";
                 new java.io.File(outDir).mkdirs();
 
-                output("Starting fuzzing lab: " + SEEDS.length + " random + " + SEEDS.length + " hill-climbing runs (5 mins each)...");
+                output("Starting fuzzing lab for Task 3.");
+                output("Modes: " + String.join(", ", activeModes));
+                output("Seeds per mode: " + SEEDS.length);
+                output("Timeout per run: " + (runtimeMillis / 1000) + " seconds");
                 output("Output directory: " + outDir);
 
                 List<String[]> allSummaries = new ArrayList<>();
 
-                output("========== RANDOM FUZZING PHASE ==========");
-                for (int runIdx = 0; runIdx < SEEDS.length; runIdx++) {
-                        long seed = SEEDS[runIdx];
-                        output("=== Random run " + (runIdx + 1) + "/" + SEEDS.length + " (seed=" + seed + ") ===");
-                        allSummaries.add(runSingleSeed(seed, runIdx + 1, "random"));
-                }
-
-                output("========== HILL-CLIMBING FUZZING PHASE ==========");
-                for (int runIdx = 0; runIdx < SEEDS.length; runIdx++) {
-                        long seed = SEEDS[runIdx];
-                        output("=== Hill-climbing run " + (runIdx + 1) + "/" + SEEDS.length + " (seed=" + seed + ") ===");
-                        allSummaries.add(runSingleSeed(seed, runIdx + 1, "hillclimb"));
+                for (String mode : activeModes) {
+                        output("========== " + mode.toUpperCase() + " PHASE ==========");
+                        for (int runIdx = 0; runIdx < SEEDS.length; runIdx++) {
+                                long seed = SEEDS[runIdx];
+                                output("=== " + mode + " run " + (runIdx + 1) + "/" + SEEDS.length + " (seed=" + seed + ") ===");
+                                allSummaries.add(runSingleSeed(seed, runIdx + 1, mode));
+                        }
                 }
 
                 saveSummaryCSV(allSummaries);
                 saveStatsCSV(allSummaries);
-                output("All runs complete. Results saved in results/");
+                output("All runs complete. Results saved in " + outDir);
                 isFinished = true;
         }
 
         static String[] runSingleSeed(long seed, int runIndex, String mode) {
+                if (!mode.equals("random") && !isHillMode(mode)) {
+                        throw new IllegalArgumentException("Unknown fuzzing mode: " + mode);
+                }
+
                 r = new Random(seed);
                 currentSeed = seed;
                 bestTraceAndDistance = null;
@@ -867,126 +1085,67 @@ public class FuzzingLab {
                 initialize(DistanceTracker.inputSymbols);
 
                 long startTime = System.currentTimeMillis();
-                long runtimeMillis = 5 * 60 * 1000L;
                 long endTime = startTime + runtimeMillis;
                 lastSnapshotTime = startTime;
                 int executedTraces = 0;
+                boolean improved = isImprovedMode(mode);
 
                 currentRunSnapshots.add(new long[]{0, 0, 0, 0, 0});
 
                 if (mode.equals("random")) {
                         while (System.currentTimeMillis() < endTime) {
-                                try {
-                                        currentTrace = generateRandomTrace(DistanceTracker.inputSymbols);
-                                        currentTotalTraceDistance = 0.0;
-                                        currentTraceBranches.clear();
-
-                                        DistanceTracker.runNextFuzzedSequence(currentTrace.toArray(new String[0]));
-
-                                        updateBestRandomTrace();
-                                        executedTraces++;
-
-                                        long now = System.currentTimeMillis();
-                                        if (now - lastSnapshotTime >= SNAPSHOT_INTERVAL_MS) {
-                                                currentRunSnapshots.add(new long[]{
-                                                        now - startTime,
-                                                        executedTraces,
-                                                        totalVisitedBranches.size(),
-                                                        countReachedBranches(),
-                                                        uniqueErrorIds.size()
-                                                });
-                                                lastSnapshotTime = now;
-                                                output("[Run " + runIndex + " random] Traces: " + executedTraces
-                                                        + ", visited: " + totalVisitedBranches.size()
-                                                        + ", reached: " + countReachedBranches()
-                                                        + ", errors: " + uniqueErrorIds.size());
-                                        }
-
-                                } catch (Exception e) {
-                                        output("Error: " + e.getMessage());
-                                        parseAndTrackErrors(e.getMessage());
-                                }
+                                executeTraceAndUpdateCorpus(generateRandomTrace(DistanceTracker.inputSymbols), false);
+                                executedTraces++;
+                                maybeSnapshot(runIndex, mode, startTime, executedTraces, null, Double.NaN);
                         }
-                } else { // hillclimb
+                } else {
                         while (System.currentTimeMillis() < endTime) {
                                 List<String> unreached = getUnreachedBranchesSorted();
-                                currentTarget = getNextTarget(unreached, "shortest");
+                                currentTarget = getNextTarget(unreached, improved ? "coverageAware" : "shortest");
 
                                 if (currentTarget == null) {
-                                        // All known branches covered; run random to discover new ones
-                                        try {
-                                                currentTrace = generateRandomTrace(DistanceTracker.inputSymbols);
-                                                currentTotalTraceDistance = 0.0;
-                                                currentTraceBranches.clear();
-                                                DistanceTracker.runNextFuzzedSequence(currentTrace.toArray(new String[0]));
-                                                updateBestRandomTrace();
-                                                executedTraces++;
-                                        } catch (Exception e) {
-                                                output("Error: " + e.getMessage());
-                                                parseAndTrackErrors(e.getMessage());
-                                        }
+                                        List<String> discoveryTrace = improved
+                                                        ? fuzzImproved(DistanceTracker.inputSymbols, 0)
+                                                        : generateRandomTrace(DistanceTracker.inputSymbols);
+                                        executeTraceAndUpdateCorpus(discoveryTrace, improved);
+                                        executedTraces++;
+                                        maybeSnapshot(runIndex, mode, startTime, executedTraces, null, Double.NaN);
                                         continue;
                                 }
 
+                                targetAttempts.put(currentTarget, targetAttempts.getOrDefault(currentTarget, 0) + 1);
                                 int noImproveCount = 0;
 
                                 while (noImproveCount < maxIterationWithoutImprovement
                                        && System.currentTimeMillis() < endTime) {
                                         double prevBestDist = bestBranchDistances.getOrDefault(currentTarget, Double.MAX_VALUE);
 
-                                        currentTrace = fuzz(DistanceTracker.inputSymbols, 2);
-                                        currentTotalTraceDistance = 0.0;
-                                        currentTraceBranches.clear();
-
-                                        try {
-                                                DistanceTracker.runNextFuzzedSequence(currentTrace.toArray(new String[0]));
-                                        } catch (Exception e) {
-                                                output("Error: " + e.getMessage());
-                                                parseAndTrackErrors(e.getMessage());
-                                        }
-
-                                        updateBestRandomTrace();
+                                        List<String> candidate = improved
+                                                        ? fuzzImproved(DistanceTracker.inputSymbols, noImproveCount)
+                                                        : fuzz(DistanceTracker.inputSymbols, 2);
+                                        executeTraceAndUpdateCorpus(candidate, improved);
                                         executedTraces++;
 
                                         double newBestDist = bestBranchDistances.getOrDefault(currentTarget, Double.MAX_VALUE);
                                         if (newBestDist < prevBestDist) {
                                                 noImproveCount = 0;
-                                                if (newBestDist == 0.0) break;
+                                                if (newBestDist == 0.0) {
+                                                        targetSuccesses.put(currentTarget, targetSuccesses.getOrDefault(currentTarget, 0) + 1);
+                                                        break;
+                                                }
                                         } else {
                                                 noImproveCount++;
                                         }
 
-                                        long now = System.currentTimeMillis();
-                                        if (now - lastSnapshotTime >= SNAPSHOT_INTERVAL_MS) {
-                                                currentRunSnapshots.add(new long[]{
-                                                        now - startTime,
-                                                        executedTraces,
-                                                        totalVisitedBranches.size(),
-                                                        countReachedBranches(),
-                                                        uniqueErrorIds.size()
-                                                });
-                                                lastSnapshotTime = now;
-                                                output("[Run " + runIndex + " hillclimb] Traces: " + executedTraces
-                                                        + ", target: " + currentTarget
-                                                        + ", dist: " + String.format("%.3f", newBestDist)
-                                                        + ", reached: " + countReachedBranches() + "/" + bestBranchDistances.size()
-                                                        + ", errors: " + uniqueErrorIds.size());
-                                        }
+                                        maybeSnapshot(runIndex, mode, startTime, executedTraces, currentTarget, newBestDist);
                                 }
 
-                                // Random restart if target was not covered
                                 if (bestBranchDistances.getOrDefault(currentTarget, Double.MAX_VALUE) > 0.0) {
-                                        try {
-                                                currentTrace = generateRandomTrace(DistanceTracker.inputSymbols);
-                                                currentTotalTraceDistance = 0.0;
-                                                currentTraceBranches.clear();
-                                                DistanceTracker.runNextFuzzedSequence(currentTrace.toArray(new String[0]));
-                                                updateBestRandomTrace();
-                                                executedTraces++;
-                                        } catch (Exception e) {
-                                                output("Error: " + e.getMessage());
-                                                parseAndTrackErrors(e.getMessage());
-                                        }
+                                        List<String> restartTrace = improved
+                                                        ? fuzzImproved(DistanceTracker.inputSymbols, maxIterationWithoutImprovement)
+                                                        : generateRandomTrace(DistanceTracker.inputSymbols);
+                                        executeTraceAndUpdateCorpus(restartTrace, improved);
+                                        executedTraces++;
                                 }
                         }
                 }
@@ -1014,6 +1173,29 @@ public class FuzzingLab {
                         String.valueOf(uniqueErrorIds.size()),
                         String.valueOf(actualRuntime / 1000)
                 };
+        }
+
+        static void maybeSnapshot(int runIndex, String mode, long startTime, int executedTraces, String target, double targetDistance) {
+                long now = System.currentTimeMillis();
+                if (now - lastSnapshotTime >= SNAPSHOT_INTERVAL_MS) {
+                        currentRunSnapshots.add(new long[]{
+                                now - startTime,
+                                executedTraces,
+                                totalVisitedBranches.size(),
+                                countReachedBranches(),
+                                uniqueErrorIds.size()
+                        });
+                        lastSnapshotTime = now;
+
+                        String targetInfo = target == null
+                                        ? ""
+                                        : ", target: " + target + ", dist: " + String.format("%.3f", targetDistance);
+                        output("[Run " + runIndex + " " + mode + "] Traces: " + executedTraces
+                                + ", visited: " + totalVisitedBranches.size()
+                                + ", reached: " + countReachedBranches() + "/" + bestBranchDistances.size()
+                                + ", errors: " + uniqueErrorIds.size()
+                                + targetInfo);
+                }
         }
 
         static int countReachedBranches() {
